@@ -8,8 +8,8 @@ from discord import app_commands
 # ---------------- CONFIG ----------------
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
-GUILD_ID = 123456789012345678          # your server ID (int)
-STATS_CHANNEL_ID = 123456789012345678  # your stats channel ID (int)
+GUILD_ID = 1411337568691421234          # your server ID (int)
+STATS_CHANNEL_ID = 1470111152183709826  # your stats channel ID (int)
 
 # Optional: only process messages posted by this webhook id
 WEBHOOK_ID_ALLOWED = None  # e.g. 123456789012345678

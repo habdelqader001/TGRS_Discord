@@ -1,12 +1,33 @@
 # Official_Records_Officer.py
-# - Kill tiers + Operation tiers
-# - Tracks lifetime AI kills + operations participated (deduped per report)
-# - Reposts processed report to another channel
+# Firestore-backed Discord bot for Arma Reforger stats.
+#
+# Features:
+# - /link uid:<UID>  links a Bohemia/Arma UID to the Discord user
+# - Watches STATS_CHANNEL_ID for webhook reports (content or embeds)
+# - Parses player lines, increments lifetime AI kills
+# - Tracks "operations participated" with dedupe per operation (per UID)
+# - Assigns kill-tier + operation-tier roles (exclusive within each tier group)
+# - Reposts the processed report to REPOST_CHANNEL_ID as-is
+# - On startup: initializes Firestore "meta/bootstrap" doc so DB is not empty
+#
+# Install:
+#   pip install -U discord.py Flask firebase-admin python-dotenv
+#
+# Discord:
+# - Invite bot with scopes: bot + applications.commands
+# - Enable intents in Dev Portal: Server Members + Message Content
+# - Bot needs "Manage Roles" and its top role must be ABOVE the tier roles
+#
+# Render:
+# - Provide DISCORD_BOT_TOKEN
+# - Provide FIREBASE_SERVICE_ACCOUNT_JSON (or FIREBASE_SERVICE_ACCOUNT_B64)
+# - keep_alive binds to PORT env var
 
 import os
 import re
 import json
-from pathlib import Path
+import base64
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
@@ -14,6 +35,10 @@ from discord.ext import commands
 
 from dotenv import load_dotenv
 from keep_alive import keep_alive
+
+import firebase_admin
+from firebase_admin import credentials
+from firebase_admin import firestore
 
 # ---------------- BOOTSTRAP ----------------
 load_dotenv()
@@ -31,6 +56,7 @@ REPOST_CHANNEL_ID = 1467110703012774021
 WEBHOOK_ID_ALLOWED = None  # set to webhook id int if you want to restrict
 
 # ---------------- ROLE TIERS ----------------
+# Kill tiers (exclusive among themselves)
 KILL_TIERS = [
     (25,  1473038917946183803),
     (50,  1473038228381761701),
@@ -40,6 +66,7 @@ KILL_TIERS = [
 ]
 ALL_KILL_ROLE_IDS = [rid for _, rid in KILL_TIERS]
 
+# Operation tiers (exclusive among themselves)
 OP_TIERS = [
     (5,  1474156917717864624),
     (10, 1474157240289329376),
@@ -48,34 +75,75 @@ OP_TIERS = [
 ]
 ALL_OP_ROLE_IDS = [rid for _, rid in OP_TIERS]
 
-# ---------------- STORAGE ----------------
-BASE_DIR = Path(__file__).resolve().parent
-LINKS_PATH = BASE_DIR / "links.json"         # uid -> discordUserId
-TOTALS_PATH = BASE_DIR / "totals.json"       # uid -> totalKills
-OPS_PATH = BASE_DIR / "operations.json"      # uid -> operationsCount
-SEEN_OPS_PATH = BASE_DIR / "seen_ops.json"   # uid -> [opKey, ...]
+# ---------------- FIRESTORE INIT ----------------
+import base64, json, os
+
+def _load_service_account_info() -> dict:
+    raw = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+    b64 = os.getenv("FIREBASE_SERVICE_ACCOUNT_B64")
+
+    # Prefer B64 (and ignore empties)
+    if b64 and b64.strip():
+        decoded = base64.b64decode(b64.strip().encode("utf-8")).decode("utf-8")
+        info = json.loads(decoded)
+        if "private_key" in info and isinstance(info["private_key"], str):
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
+        return info
+
+    # Only use raw JSON if it's non-empty
+    if raw and raw.strip():
+        info = json.loads(raw.strip())
+        if "private_key" in info and isinstance(info["private_key"], str):
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
+        return info
+
+    gac = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if gac and os.path.exists(gac):
+        with open(gac, "r", encoding="utf-8") as f:
+            info = json.load(f)
+        if "private_key" in info and isinstance(info["private_key"], str):
+            info["private_key"] = info["private_key"].replace("\\n", "\n")
+        return info
+
+    raise RuntimeError(
+        "Missing Firebase credentials. Set FIREBASE_SERVICE_ACCOUNT_B64 (recommended) "
+        "or FIREBASE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS."
+    )
 
 
-def load_json(path: Path, default):
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
+def init_firestore():
+    info = _load_service_account_info()
+    cred = credentials.Certificate(info)
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(cred)
 
+    db = firestore.client()
 
-def save_json(path: Path, data):
-    """
-    Simple write (less moving parts). If you prefer atomic swap, keep your atomic writer,
-    but this is easier to troubleshoot.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    # Bootstrap doc (so you can SEE the DB isn't empty)
+    db.collection("meta").document("bootstrap").set(
+        {
+            "bootstrappedAt": firestore.SERVER_TIMESTAMP,
+            "note": "If you can see this, Firestore writes work.",
+        },
+        merge=True,
+    )
 
+    # Log project id (helps catch "writing to the wrong project" mistakes)
+    pid = info.get("project_id", "(unknown)")
+    print(f"[Firestore] Initialized. project_id={pid}")
+    return db
 
-links = load_json(LINKS_PATH, {})
-totals = load_json(TOTALS_PATH, {})
-operations = load_json(OPS_PATH, {})
-seen_ops = load_json(SEEN_OPS_PATH, {})
+db = init_firestore()
+
+# Collections:
+# users/{uid} -> { kills: int, operations: int, updatedAt: ts }
+# users/{uid}/ops/{opKey} -> { seenAt: ts }  (dedupe)
+# links/{uid} -> { discordUserId: str, updatedAt: ts }
+# discord_links/{discordUserId} -> { uid: str, updatedAt: ts }
+
+USERS_COL = "users"
+LINKS_COL = "links"
+DISCORD_LINKS_COL = "discord_links"
 
 # ---------------- TEXT EXTRACTION ----------------
 def get_report_text(message: discord.Message) -> str:
@@ -97,17 +165,46 @@ def get_report_text(message: discord.Message) -> str:
 # ---------------- PARSING ----------------
 _PIPE = r"[|│]"
 
+UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+# ---- NEW: sanitize repost (remove UID segments) ----
+_UUID_BODY = UUID_RE.pattern[1:-1]  # remove ^ $
+_UID_SEGMENT_RE = re.compile(
+    rf"\s*{_PIPE}\s*(?:UID|BohemiaID)\s*:\s*\{{?\s*{_UUID_BODY}\s*\}}?\s*",
+    re.IGNORECASE,
+)
+
+def sanitize_report_for_repost(text: str) -> str:
+    if not text:
+        return text
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Remove "| UID: <uuid>" (or BohemiaID) segments
+    t = _UID_SEGMENT_RE.sub(" ", t)
+
+    # Normalize double pipes and spacing around pipes
+    t = re.sub(r"\s*\|\s*\|\s*", " | ", t)
+    t = re.sub(r"\s*\|\s*", " | ", t)
+
+    # Clean excessive spaces
+    t = re.sub(r"[ \t]{2,}", " ", t)
+
+    # Also handle unicode pipe variant spacing
+    t = re.sub(r"\s*│\s*", " | ", t)
+
+    return t.strip()
 
 def parse_operation_key(report_text: str, message: discord.Message) -> str:
     """
-    Tries to build: YYYY-MM-DD|HH:MM:SSZ|Scenario
-    If parsing fails, fall back to unique message.id so operations still count reliably.
+    Tries: YYYY-MM-DD|HH:MM:SSZ|Scenario
+    If parsing fails, uses unique Discord message id so ops still count reliably.
     """
     t = report_text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # tolerate emojis, markdown, extra spaces
     date_match = re.search(
-        r"Date:\s*([0-9]{4}-[0-9]{2}-[0-9]{2})\s*"+_PIPE+r"\s*Time:\s*([0-9]{2}:[0-9]{2}:[0-9]{2}Z)",
+        r"Date:\s*([0-9]{4}-[0-9]{2}-[0-9]{2})\s*" + _PIPE + r"\s*Time:\s*([0-9]{2}:[0-9]{2}:[0-9]{2}Z)",
         t,
         re.IGNORECASE,
     )
@@ -119,9 +216,7 @@ def parse_operation_key(report_text: str, message: discord.Message) -> str:
         scenario = scen_match.group(1).strip()
         return f"{date_str}|{time_str}|{scenario}"
 
-    # Fallback: dedupe per Discord message (unique)
     return f"msg:{message.id}"
-
 
 def parse_players_from_report(report_text: str):
     """
@@ -150,7 +245,7 @@ def parse_players_from_report(report_text: str):
         if clean.lower().startswith("objectives"):
             break
 
-        ln2 = re.sub(r"^\s*-\s*", "", ln)  # remove markdown bullets
+        ln2 = re.sub(r"^\s*-\s*", "", ln)  # remove "- " bullets
 
         m = re.match(
             rf"^(.+?)\s*{_PIPE}\s*(?:UID|BohemiaID)\s*:\s*([A-Za-z0-9\-_:.\{{\}}]+)\s*{_PIPE}\s*AI Kills\s*:\s*(\d+)\b",
@@ -159,48 +254,25 @@ def parse_players_from_report(report_text: str):
         )
         if not m:
             continue
+        uid = m.group(2).strip().strip("{}")
+        if not UUID_RE.fullmatch(uid):
+            continue
 
         players.append({
             "name": m.group(1).strip(),
-            "uid": m.group(2).strip().strip("{}"),
+            "uid": uid,
             "aiKills": int(m.group(3)),
         })
 
     return players
 
-# ---------------- LOGIC ----------------
-def ensure_user_buckets(uid: str):
-    if uid not in totals:
-        totals[uid] = 0
-    if uid not in operations:
-        operations[uid] = 0
-    if uid not in seen_ops:
-        seen_ops[uid] = []
-
-
-def increment_operations_for_player(uid: str, op_key: str) -> bool:
-    """
-    Dedupes per uid per op_key. Returns True if incremented.
-    """
-    ensure_user_buckets(uid)
-
-    existing = seen_ops.get(uid, [])
-    if op_key in existing:
-        return False
-
-    existing.append(op_key)
-    seen_ops[uid] = existing
-    operations[uid] = int(operations.get(uid, 0)) + 1
-    return True
-
-
+# ---------------- ROLE HELPERS ----------------
 def tier_for_value(value: int, tiers):
     best = None
     for min_v, role_id in sorted(tiers, key=lambda x: x[0]):
         if value >= min_v:
             best = (min_v, role_id)
     return best
-
 
 async def apply_exclusive_tier_role(guild, member, value, tiers, all_role_ids, reason):
     chosen = tier_for_value(value, tiers)
@@ -223,15 +295,88 @@ async def apply_exclusive_tier_role(guild, member, value, tiers, all_role_ids, r
     except (discord.Forbidden, discord.HTTPException):
         return
 
-# ---------------- BOT ----------------
+# ---------------- FIRESTORE DATA OPS ----------------
+def get_user_doc(uid: str):
+    return db.collection(USERS_COL).document(uid)
+
+def get_op_doc(uid: str, op_key: str):
+    # op_key contains '|' which is allowed in Firestore doc IDs, but to be safe you can replace it.
+    safe_key = op_key.replace("/", "_")
+    return db.collection(USERS_COL).document(uid).collection("ops").document(safe_key)
+
+def link_uid_to_discord(uid: str, discord_user_id: str):
+    # Forward
+    db.collection(LINKS_COL).document(uid).set(
+        {"discordUserId": discord_user_id, "updatedAt": firestore.SERVER_TIMESTAMP},
+        merge=True,
+    )
+    # Reverse
+    db.collection(DISCORD_LINKS_COL).document(discord_user_id).set(
+        {"uid": uid, "updatedAt": firestore.SERVER_TIMESTAMP},
+        merge=True,
+    )
+
+def lookup_uid_by_discord(discord_user_id: str):
+    doc = db.collection(DISCORD_LINKS_COL).document(discord_user_id).get()
+    if doc.exists:
+        data = doc.to_dict() or {}
+        return data.get("uid")
+    return None
+
+def lookup_discord_by_uid(uid: str):
+    doc = db.collection(LINKS_COL).document(uid).get()
+    if doc.exists:
+        data = doc.to_dict() or {}
+        return data.get("discordUserId")
+    return None
+
+def apply_report_to_uid(uid: str, ai_kills: int, op_key: str):
+    """
+    Transaction:
+    - If users/{uid}/ops/{op_key} doesn't exist -> create it and increment operations by 1
+    - Always increment kills by ai_kills
+    Returns: (new_kills_total, new_ops_total, ops_incremented_bool)
+    """
+    user_ref = get_user_doc(uid)
+    op_ref = get_op_doc(uid, op_key)
+
+    @firestore.transactional
+    def _txn(txn: firestore.Transaction):
+        user_snap = user_ref.get(transaction=txn)
+        op_snap = op_ref.get(transaction=txn)
+
+        current = user_snap.to_dict() if user_snap.exists else {}
+        cur_kills = int(current.get("kills", 0))
+        cur_ops = int(current.get("operations", 0))
+
+        new_kills = cur_kills + int(ai_kills)
+        ops_inc = False
+        new_ops = cur_ops
+
+        if not op_snap.exists:
+            ops_inc = True
+            new_ops = cur_ops + 1
+            txn.set(op_ref, {"seenAt": firestore.SERVER_TIMESTAMP}, merge=True)
+
+        txn.set(
+            user_ref,
+            {"kills": new_kills, "operations": new_ops, "updatedAt": firestore.SERVER_TIMESTAMP},
+            merge=True,
+        )
+
+        return new_kills, new_ops, ops_inc
+
+    txn = db.transaction()
+    return _txn(txn)
+
+# ---------------- DISCORD BOT ----------------
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
 intents.messages = True
-intents.message_content = True  # must be enabled in Dev Portal too
+intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-
 
 @bot.event
 async def setup_hook():
@@ -240,11 +385,9 @@ async def setup_hook():
     synced = await bot.tree.sync(guild=guild_obj)
     print(f"Synced {len(synced)} commands to guild {GUILD_ID}")
 
-
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-
 
 @bot.tree.command(
     name="link",
@@ -255,26 +398,26 @@ async def on_ready():
 async def link_cmd(interaction: discord.Interaction, uid: str):
     uid = uid.strip()
 
-    if not re.fullmatch(r"[A-Za-z0-9\-\_\:\.]{6,128}", uid):
+    if not UUID_RE.fullmatch(uid):
         await interaction.response.send_message(
-            "That UID format looks invalid. Please copy/paste it exactly from the report.",
+            "Invalid UID format. It must be 36 chars in 8-4-4-4-12 form (example: 123e4567-e89b-12d3-a456-426614174000).",
             ephemeral=True,
         )
         return
 
-    links[uid] = str(interaction.user.id)
-    save_json(LINKS_PATH, links)
 
-    ensure_user_buckets(uid)
-    save_json(TOTALS_PATH, totals)
-    save_json(OPS_PATH, operations)
-    save_json(SEEN_OPS_PATH, seen_ops)
+    link_uid_to_discord(uid, str(interaction.user.id))
+
+    # Ensure user doc exists (initialize)
+    get_user_doc(uid).set(
+        {"kills": firestore.Increment(0), "operations": firestore.Increment(0), "updatedAt": firestore.SERVER_TIMESTAMP},
+        merge=True,
+    )
 
     await interaction.response.send_message(
         f"Linked UID `{uid}` to your Discord account.",
         ephemeral=True,
     )
-
 
 @bot.tree.command(
     name="stats",
@@ -283,12 +426,7 @@ async def link_cmd(interaction: discord.Interaction, uid: str):
 )
 async def stats_cmd(interaction: discord.Interaction):
     discord_id = str(interaction.user.id)
-
-    uid = None
-    for k, v in links.items():
-        if v == discord_id:
-            uid = k
-            break
+    uid = lookup_uid_by_discord(discord_id)
 
     if not uid:
         await interaction.response.send_message(
@@ -297,13 +435,15 @@ async def stats_cmd(interaction: discord.Interaction):
         )
         return
 
-    k = int(totals.get(uid, 0))
-    ops = int(operations.get(uid, 0))
+    snap = get_user_doc(uid).get()
+    data = snap.to_dict() if snap.exists else {}
+    kills = int(data.get("kills", 0))
+    ops = int(data.get("operations", 0))
+
     await interaction.response.send_message(
-        f"UID `{uid}`\nAI Kills: **{k}**\nOperations: **{ops}**",
+        f"UID `{uid}`\nAI Kills: **{kills}**\nOperations: **{ops}**",
         ephemeral=True,
     )
-
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -312,7 +452,7 @@ async def on_message(message: discord.Message):
     if message.author == bot.user:
         return
 
-    # Avoid repost-loop
+    # avoid repost loops
     if message.channel.id == REPOST_CHANNEL_ID:
         return
 
@@ -337,26 +477,22 @@ async def on_message(message: discord.Message):
     if guild is None:
         return
 
-    # Update totals + operations for ALL participants (linked or not)
+    # 1) Update Firestore totals + ops for ALL players
+    #    (transaction + per-uid per-op dedupe)
+    updated = []  # (uid, new_kills, new_ops, ops_inc)
     for p in players:
         uid = p["uid"]
         ai_kills = p["aiKills"]
+        try:
+            new_kills, new_ops, ops_inc = apply_report_to_uid(uid, ai_kills, op_key)
+            print(f"uid={uid} kills+={ai_kills} ops_inc={ops_inc} ops_now={new_ops}")
+            updated.append((uid, new_kills, new_ops))
+        except Exception as e:
+            print(f"[Firestore] Failed updating uid={uid}: {e}")
 
-        ensure_user_buckets(uid)
-        totals[uid] = int(totals.get(uid, 0)) + ai_kills
-
-        did_inc = increment_operations_for_player(uid, op_key)
-        print(f"uid={uid} kills+={ai_kills} ops_inc={did_inc} ops_now={operations.get(uid)}")
-
-    # Always save after processing a valid report
-    save_json(TOTALS_PATH, totals)
-    save_json(OPS_PATH, operations)
-    save_json(SEEN_OPS_PATH, seen_ops)
-
-    # Assign roles only for linked users
-    for p in players:
-        uid = p["uid"]
-        discord_user_id = links.get(uid)
+    # 2) Assign roles ONLY for linked users
+    for uid, new_kills, new_ops in updated:
+        discord_user_id = lookup_discord_by_uid(uid)
         if not discord_user_id:
             continue
 
@@ -370,7 +506,7 @@ async def on_message(message: discord.Message):
         await apply_exclusive_tier_role(
             guild=guild,
             member=member,
-            value=int(totals.get(uid, 0)),
+            value=int(new_kills),
             tiers=KILL_TIERS,
             all_role_ids=ALL_KILL_ROLE_IDS,
             reason="AI kills tier update",
@@ -379,22 +515,38 @@ async def on_message(message: discord.Message):
         await apply_exclusive_tier_role(
             guild=guild,
             member=member,
-            value=int(operations.get(uid, 0)),
+            value=int(new_ops),
             tiers=OP_TIERS,
             all_role_ids=ALL_OP_ROLE_IDS,
             reason="Operations tier update",
         )
 
-    # Repost the report as-is
+    # 3) Repost the report as-is (BUT remove UID from player lines)
     try:
         dest = bot.get_channel(REPOST_CHANNEL_ID) or await bot.fetch_channel(REPOST_CHANNEL_ID)
+
         if message.embeds:
             for e in message.embeds:
-                await dest.send(embed=e)
-        else:
-            await dest.send(report_text)
-    except (discord.Forbidden, discord.HTTPException):
-        pass
+                ed = e.to_dict()
+                new_e = discord.Embed.from_dict(ed)
 
+                if new_e.description:
+                    new_e.description = sanitize_report_for_repost(new_e.description)
+
+                # sanitize fields (some webhooks put the Players list in fields)
+                if getattr(new_e, "fields", None):
+                    old_fields = list(new_e.fields)
+                    new_e.clear_fields()  # supported by discord.py embed class :contentReference[oaicite:1]{index=1}
+                    for f in old_fields:
+                        fname = sanitize_report_for_repost(f.name) if f.name else f.name
+                        fval = sanitize_report_for_repost(f.value) if f.value else f.value
+                        new_e.add_field(name=fname, value=fval, inline=f.inline)
+
+                await dest.send(embed=new_e)
+        else:
+            await dest.send(sanitize_report_for_repost(report_text))
+
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"[Repost] Failed: {e}")
 
 bot.run(DISCORD_TOKEN)

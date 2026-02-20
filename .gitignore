@@ -5,3 +5,10 @@ tgrs_env/
 .env
 # libraries
 __pycache__
+#db
+links.json
+operations.json
+seen_ops.json
+totals.json
+#others
+manual_migration_to_firebase.py

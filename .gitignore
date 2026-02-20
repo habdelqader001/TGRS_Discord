@@ -5,8 +5,3 @@ tgrs_env/
 .env
 # libraries
 __pycache__
-#DB
-totals.json
-links.json
-seen_ops.json
-operations.json

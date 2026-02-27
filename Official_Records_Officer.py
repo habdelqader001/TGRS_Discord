@@ -138,8 +138,8 @@ db = init_firestore()
 # Collections:
 # users/{uid} -> { kills: int, operations: int, updatedAt: ts }
 # users/{uid}/ops/{opKey} -> { seenAt: ts }  (dedupe)
-# links/{uid} -> { discordUserId: str, updatedAt: ts }
-# discord_links/{discordUserId} -> { uid: str, updatedAt: ts }
+# links/{uid} -> { discordUserId: str, discordDisplayName: str, updatedAt: ts }
+# discord_links/{discordUserId} -> { uid: str, discordDisplayName: str, updatedAt: ts }
 
 USERS_COL = "users"
 LINKS_COL = "links"
@@ -304,15 +304,23 @@ def get_op_doc(uid: str, op_key: str):
     safe_key = op_key.replace("/", "_")
     return db.collection(USERS_COL).document(uid).collection("ops").document(safe_key)
 
-def link_uid_to_discord(uid: str, discord_user_id: str):
+def link_uid_to_discord(uid: str, discord_user_id: str, discord_display_name: str):
     # Forward
     db.collection(LINKS_COL).document(uid).set(
-        {"discordUserId": discord_user_id, "updatedAt": firestore.SERVER_TIMESTAMP},
+        {
+            "discordUserId": discord_user_id,
+            "discordDisplayName": discord_display_name,
+            "updatedAt": firestore.SERVER_TIMESTAMP
+        },
         merge=True,
     )
     # Reverse
     db.collection(DISCORD_LINKS_COL).document(discord_user_id).set(
-        {"uid": uid, "updatedAt": firestore.SERVER_TIMESTAMP},
+        {
+            "uid": uid,
+            "discordDisplayName": discord_display_name,
+            "updatedAt": firestore.SERVER_TIMESTAMP
+        },
         merge=True,
     )
 
@@ -329,6 +337,25 @@ def lookup_discord_by_uid(uid: str):
         data = doc.to_dict() or {}
         return data.get("discordUserId")
     return None
+
+def update_display_name_by_discord(discord_user_id: str, new_display_name: str):
+    rev = db.collection(DISCORD_LINKS_COL).document(discord_user_id).get()
+    if not rev.exists:
+        return False
+
+    uid = (rev.to_dict() or {}).get("uid")
+    if not uid:
+        return False
+
+    db.collection(DISCORD_LINKS_COL).document(discord_user_id).set(
+        {"discordDisplayName": new_display_name, "updatedAt": firestore.SERVER_TIMESTAMP},
+        merge=True,
+    )
+    db.collection(LINKS_COL).document(uid).set(
+        {"discordDisplayName": new_display_name, "updatedAt": firestore.SERVER_TIMESTAMP},
+        merge=True,
+    )
+    return True
 
 def apply_report_to_uid(uid: str, ai_kills: int, op_key: str):
     """
@@ -388,7 +415,87 @@ async def setup_hook():
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+@bot.tree.command(
+    name="admin_refresh_names",
+    description="ADMIN: Refresh Discord display names for all linked users in Firestore.",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def admin_refresh_names_cmd(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "Starting refresh… this may take a bit depending on how many links you have.",
+        ephemeral=True,
+    )
 
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        await interaction.followup.send("Guild not found.", ephemeral=True)
+        return
+
+    updated = 0
+    missing_member = 0
+    missing_uid = 0
+    errors = 0
+
+    try:
+        docs = db.collection(DISCORD_LINKS_COL).stream()
+        for doc in docs:
+            discord_user_id = doc.id
+            data = doc.to_dict() or {}
+            uid = data.get("uid")
+            if not uid:
+                missing_uid += 1
+                continue
+
+            # fetch member
+            member = guild.get_member(int(discord_user_id))
+            if member is None:
+                try:
+                    member = await guild.fetch_member(int(discord_user_id))
+                except discord.NotFound:
+                    missing_member += 1
+                    continue
+                except Exception:
+                    errors += 1
+                    continue
+
+            display_name = member.display_name
+
+            try:
+                # update both forward + reverse docs
+                db.collection(DISCORD_LINKS_COL).document(discord_user_id).set(
+                    {"discordDisplayName": display_name, "updatedAt": firestore.SERVER_TIMESTAMP},
+                    merge=True,
+                )
+                db.collection(LINKS_COL).document(uid).set(
+                    {"discordDisplayName": display_name, "updatedAt": firestore.SERVER_TIMESTAMP},
+                    merge=True,
+                )
+                updated += 1
+            except Exception:
+                errors += 1
+
+    except Exception as e:
+        await interaction.followup.send(f"Failed while streaming Firestore docs: {e}", ephemeral=True)
+        return
+
+    await interaction.followup.send(
+        f"Done.\n"
+        f"✅ Updated: {updated}\n"
+        f"⚠️ Missing members: {missing_member}\n"
+        f"⚠️ Missing uid in discord_links: {missing_uid}\n"
+        f"❌ Errors: {errors}",
+        ephemeral=True,
+    )
+@admin_refresh_names_cmd.error
+async def admin_refresh_names_cmd_error(interaction: discord.Interaction, error: Exception):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("You must be an Administrator to use this command.", ephemeral=True)
+    else:
+        try:
+            await interaction.response.send_message(f"Error: {error}", ephemeral=True)
+        except discord.InteractionResponded:
+            await interaction.followup.send(f"Error: {error}", ephemeral=True)
 @bot.tree.command(
     name="link",
     description="Link your UID (from the stats report) to your Discord account for role rewards.",
@@ -405,8 +512,7 @@ async def link_cmd(interaction: discord.Interaction, uid: str):
         )
         return
 
-
-    link_uid_to_discord(uid, str(interaction.user.id))
+    link_uid_to_discord(uid, str(interaction.user.id), interaction.user.display_name)
 
     # Ensure user doc exists (initialize)
     get_user_doc(uid).set(
@@ -416,6 +522,25 @@ async def link_cmd(interaction: discord.Interaction, uid: str):
 
     await interaction.response.send_message(
         f"Linked UID `{uid}` to your Discord account.",
+        ephemeral=True,
+    )
+
+@bot.tree.command(
+    name="update_name",
+    description="Update your linked Discord display name in Firestore.",
+    guild=discord.Object(id=GUILD_ID),
+)
+async def update_name_cmd(interaction: discord.Interaction):
+    ok = update_display_name_by_discord(str(interaction.user.id), interaction.user.display_name)
+    if not ok:
+        await interaction.response.send_message(
+            "You are not linked yet. Use `/link uid:<your-uid>` first.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"Updated your stored display name to **{interaction.user.display_name}**.",
         ephemeral=True,
     )
 
@@ -536,7 +661,7 @@ async def on_message(message: discord.Message):
                 # sanitize fields (some webhooks put the Players list in fields)
                 if getattr(new_e, "fields", None):
                     old_fields = list(new_e.fields)
-                    new_e.clear_fields()  # supported by discord.py embed class :contentReference[oaicite:1]{index=1}
+                    new_e.clear_fields()
                     for f in old_fields:
                         fname = sanitize_report_for_repost(f.name) if f.name else f.name
                         fval = sanitize_report_for_repost(f.value) if f.value else f.value

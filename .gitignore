@@ -10,5 +10,7 @@ links.json
 operations.json
 seen_ops.json
 totals.json
+firebase_backup
 #others
 manual_migration_to_firebase.py
+backup_Manager.py

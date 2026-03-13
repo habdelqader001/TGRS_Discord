@@ -63,7 +63,9 @@ GUILD_ID = 1411337568691421234
 STATS_CHANNEL_ID = 1470111152183709826
 REPOST_CHANNEL_ID = 1467110703012774021
 
-WEBHOOK_ID_ALLOWED = None  # set to webhook id int if you want to restrict
+# Only messages posted by this webhook are parsed + reposted to mission info.
+# Webhook "Intelligence Officer" (channel_id matches STATS_CHANNEL_ID).
+WEBHOOK_ID_ALLOWED = 1467513629791490121
 
 # ---------------- ROLE TIERS ----------------
 KILL_TIERS = [
@@ -72,6 +74,8 @@ KILL_TIERS = [
     (100, 1473038671006400592),
     (200, 1473039071671746660),
     (500, 1474140405187481670),
+    (1000, 1477067909544284181),
+    (2000, 1482061899175563426),
 ]
 ALL_KILL_ROLE_IDS = [rid for _, rid in KILL_TIERS]
 
@@ -80,6 +84,8 @@ OP_TIERS = [
     (10, 1474157240289329376),
     (25, 1474157331603263691),
     (50, 1474157578240921671),
+    (100, 1477068112812572733),
+    (200, 1482062054977437737),
 ]
 ALL_OP_ROLE_IDS = [rid for _, rid in OP_TIERS]
 
@@ -234,8 +240,9 @@ def parse_players_from_report(report_text: str):
 
         ln2 = re.sub(r"^\s*-\s*", "", ln)
 
+        # Game may report "AI Kills" or "Enemy Kills" (same stat for tier/ops counting)
         m = re.match(
-            rf"^(.+?)\s*{_PIPE}\s*(?:UID|BohemiaID)\s*:\s*([A-Za-z0-9\-_:.\{{\}}]+)\s*{_PIPE}\s*AI Kills\s*:\s*(\d+)\b",
+            rf"^(.+?)\s*{_PIPE}\s*(?:UID|BohemiaID)\s*:\s*([A-Za-z0-9\-_:.\{{\}}]+)\s*{_PIPE}\s*(?:AI Kills|Enemy Kills)\s*:\s*(\d+)\b",
             ln2,
             re.IGNORECASE,
         )

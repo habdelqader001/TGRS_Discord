@@ -14,6 +14,7 @@ import base64
 import asyncio
 import traceback
 from datetime import datetime, timezone
+from typing import Optional
 
 import discord
 from discord import app_commands
@@ -63,9 +64,14 @@ GUILD_ID = 1411337568691421234
 STATS_CHANNEL_ID = 1470111152183709826
 REPOST_CHANNEL_ID = 1467110703012774021
 
-# Only messages posted by this webhook are parsed + reposted to mission info.
+# Only messages from this webhook OR from users with Chief Dev role are parsed + reposted.
 # Webhook "Intelligence Officer" (channel_id matches STATS_CHANNEL_ID).
 WEBHOOK_ID_ALLOWED = 1467513629791490121
+# Users with this role can also post reports that get parsed and reposted (set to 0 to disable).
+CHIEF_DEV_ROLE_ID = 1467855407065071637  # Server Settings → Roles → right-click Chief Dev → Copy ID
+
+# Role required to use /edit_aar (amend AAR in mission-information). Set to your Unit Head role ID.
+UNIT_HEAD_ROLE_ID = 1470995983746990122  # Server Settings → Roles → right-click Unit Head → Copy ID
 
 # ---------------- ROLE TIERS ----------------
 KILL_TIERS = [
@@ -160,6 +166,7 @@ db = init_firestore()
 USERS_COL = "users"
 LINKS_COL = "links"
 DISCORD_LINKS_COL = "discord_links"
+AAR_ORIGINALS_COL = "aar_originals"  # message_id -> original content for clear_amendments
 
 # ---------------- TEXT EXTRACTION ----------------
 def get_report_text(message: discord.Message) -> str:
@@ -600,6 +607,273 @@ async def admin_refresh_all_names_error(interaction: discord.Interaction, error)
         raise error
 
 
+@bot.tree.command(
+    name="edit_aar",
+    description="Amend the last (or a specific) mission AAR message in this channel.",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(
+    message_id="Optional: ID of the message to amend (right-click message → Copy ID). Omit to amend the latest AAR.",
+    text="The amendment text to append to the AAR.",
+)
+async def edit_aar_cmd(
+    interaction: discord.Interaction,
+    text: str,
+    message_id: Optional[str] = None,
+):
+    if not UNIT_HEAD_ROLE_ID:
+        await interaction.response.send_message(
+            "Edit AAR is not configured (UNIT_HEAD_ROLE_ID). Contact an admin.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command must be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        member = await interaction.guild.fetch_member(interaction.user.id)
+    except discord.NotFound:
+        member = None
+    except discord.HTTPException as e:
+        log(f"[edit_aar] Failed to fetch member {interaction.user.id}: {e}")
+        await interaction.response.send_message(
+            "Could not verify your roles. Try again in a moment.",
+            ephemeral=True,
+        )
+        return
+
+    if member is None or not any(r.id == UNIT_HEAD_ROLE_ID for r in member.roles):
+        await interaction.response.send_message(
+            "Only users with the Unit Head role can amend AARs.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.channel_id != REPOST_CHANNEL_ID:
+        await interaction.response.send_message(
+            "This command can only be used in the mission-information channel.",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.channel
+    if channel is None:
+        await interaction.response.send_message("Could not resolve channel.", ephemeral=True)
+        return
+
+    target: Optional[discord.Message] = None
+
+    if message_id is not None and message_id.strip():
+        try:
+            mid = int(message_id.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                "Invalid message ID. Use a numeric ID (right-click message → Copy ID).",
+                ephemeral=True,
+            )
+            return
+        try:
+            target = await channel.fetch_message(mid)
+        except discord.NotFound:
+            await interaction.response.send_message(
+                "Message not found in this channel.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException as e:
+            await interaction.response.send_message(
+                f"Could not fetch message: {e}",
+                ephemeral=True,
+            )
+            return
+        if target.author.id != bot.user.id:
+            await interaction.response.send_message(
+                "You can only amend messages posted by the bot (AAR reposts).",
+                ephemeral=True,
+            )
+            return
+    else:
+        # Find last message from the bot in this channel
+        async for msg in channel.history(limit=50):
+            if msg.author.id == bot.user.id:
+                target = msg
+                break
+        if target is None:
+            await interaction.response.send_message(
+                "No AAR message from the bot found in this channel.",
+                ephemeral=True,
+            )
+            return
+
+    author_label = member.display_name if member else interaction.user.display_name
+    # Allow newlines in comment (typed \n or actual newline)
+    comment_text = text.strip().replace("\\n", "\n")
+    amendment = "\n- " + author_label + " comments are: " + comment_text
+
+    try:
+        content = target.content or ""
+        lines = content.split("\n")
+        # Remove only the "(none)" that immediately follows "Additional notes:"
+        for i in range(len(lines) - 1):
+            if lines[i].strip() == "Additional notes:" and lines[i + 1].strip() == "(none)":
+                lines.pop(i + 1)
+                break
+        base_content = "\n".join(lines)
+        new_content = (base_content + amendment) if base_content.rstrip() else amendment.lstrip()
+        if len(new_content) > 2000:
+            await interaction.response.send_message(
+                "Amendment would exceed Discord's message length limit (2000 chars). Shorten the text.",
+                ephemeral=True,
+            )
+            return
+        await target.edit(content=new_content)
+        await interaction.response.send_message(
+            "AAR amended successfully.",
+            ephemeral=True,
+        )
+    except discord.HTTPException as e:
+        await interaction.response.send_message(
+            f"Failed to edit message: {e}",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="clear_aar_amendments",
+    description="Remove all amendments from an AAR message (restore original). Unit Head only.",
+    guild=discord.Object(id=GUILD_ID),
+)
+@app_commands.describe(
+    message_id="Optional: ID of the AAR message to clear. Omit to clear the latest AAR.",
+)
+async def clear_aar_amendments_cmd(
+    interaction: discord.Interaction,
+    message_id: Optional[str] = None,
+):
+    if not UNIT_HEAD_ROLE_ID:
+        await interaction.response.send_message(
+            "Clear amendments is not configured (UNIT_HEAD_ROLE_ID). Contact an admin.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command must be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        member = await interaction.guild.fetch_member(interaction.user.id)
+    except discord.NotFound:
+        member = None
+    except discord.HTTPException as e:
+        log(f"[clear_aar_amendments] Failed to fetch member {interaction.user.id}: {e}")
+        await interaction.response.send_message(
+            "Could not verify your roles. Try again in a moment.",
+            ephemeral=True,
+        )
+        return
+
+    if member is None or not any(r.id == UNIT_HEAD_ROLE_ID for r in member.roles):
+        await interaction.response.send_message(
+            "Only users with the Unit Head role can clear AAR amendments.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.channel_id != REPOST_CHANNEL_ID:
+        await interaction.response.send_message(
+            "This command can only be used in the mission-information channel.",
+            ephemeral=True,
+        )
+        return
+
+    channel = interaction.channel
+    if channel is None:
+        await interaction.response.send_message("Could not resolve channel.", ephemeral=True)
+        return
+
+    target: Optional[discord.Message] = None
+
+    if message_id is not None and message_id.strip():
+        try:
+            mid = int(message_id.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                "Invalid message ID. Use a numeric ID (right-click message → Copy ID).",
+                ephemeral=True,
+            )
+            return
+        try:
+            target = await channel.fetch_message(mid)
+        except discord.NotFound:
+            await interaction.response.send_message(
+                "Message not found in this channel.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException as e:
+            await interaction.response.send_message(
+                f"Could not fetch message: {e}",
+                ephemeral=True,
+            )
+            return
+        if target.author.id != bot.user.id:
+            await interaction.response.send_message(
+                "You can only clear amendments on messages posted by the bot (AAR reposts).",
+                ephemeral=True,
+            )
+            return
+    else:
+        async for msg in channel.history(limit=50):
+            if msg.author.id == bot.user.id:
+                target = msg
+                break
+        if target is None:
+            await interaction.response.send_message(
+                "No AAR message from the bot found in this channel.",
+                ephemeral=True,
+            )
+            return
+
+    doc = db.collection(AAR_ORIGINALS_COL).document(str(target.id)).get()
+    if not doc.exists:
+        await interaction.response.send_message(
+            "No stored original for this message (it may predate the clear feature). Amendments cannot be cleared.",
+            ephemeral=True,
+        )
+        return
+
+    data = doc.to_dict() or {}
+    if data.get("channel_id") != channel.id:
+        await interaction.response.send_message(
+            "Stored original is for a different channel.",
+            ephemeral=True,
+        )
+        return
+
+    original_content = data.get("content", "")
+
+    try:
+        await target.edit(content=original_content)
+        await interaction.response.send_message(
+            "All amendments have been removed.",
+            ephemeral=True,
+        )
+    except discord.HTTPException as e:
+        await interaction.response.send_message(
+            f"Failed to edit message: {e}",
+            ephemeral=True,
+        )
+
+
 @bot.event
 async def on_message(message: discord.Message):
     await bot.process_commands(message)
@@ -613,7 +887,22 @@ async def on_message(message: discord.Message):
     if message.channel.id != STATS_CHANNEL_ID:
         return
 
-    if WEBHOOK_ID_ALLOWED is not None and message.webhook_id != WEBHOOK_ID_ALLOWED:
+    # Allow: webhook from Intelligence Officer, or a user with Chief Dev role
+    allowed = False
+    if message.webhook_id is not None:
+        allowed = message.webhook_id == WEBHOOK_ID_ALLOWED
+    else:
+        if CHIEF_DEV_ROLE_ID and message.guild:
+            author = message.author
+            member = author if isinstance(author, discord.Member) else message.guild.get_member(author.id)
+            if member is None and message.guild:
+                try:
+                    member = await message.guild.fetch_member(author.id)
+                except (discord.NotFound, discord.HTTPException):
+                    pass
+            if member and any(r.id == CHIEF_DEV_ROLE_ID for r in member.roles):
+                allowed = True
+    if not allowed:
         return
 
     report_text = get_report_text(message)
@@ -699,9 +988,16 @@ async def on_message(message: discord.Message):
                         fval = sanitize_report_for_repost(f.value) if f.value else f.value
                         new_e.add_field(name=fname, value=fval, inline=f.inline)
 
-                await dest.send(embed=new_e)
+                sent = await dest.send(embed=new_e)
+                db.collection(AAR_ORIGINALS_COL).document(str(sent.id)).set(
+                    {"content": sent.content or "", "channel_id": dest.id}, merge=True
+                )
         else:
-            await dest.send(sanitize_report_for_repost(report_text))
+            body = sanitize_report_for_repost(report_text)
+            sent = await dest.send(body)
+            db.collection(AAR_ORIGINALS_COL).document(str(sent.id)).set(
+                {"content": sent.content or "", "channel_id": dest.id}, merge=True
+            )
 
         log("[Repost] Report reposted successfully.")
     except (discord.Forbidden, discord.HTTPException) as e:

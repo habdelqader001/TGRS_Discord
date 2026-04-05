@@ -40,9 +40,22 @@ if keep_alive:
 
 
 # ---------------- CONFIG ----------------
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    return int(raw)
+
+
 GUILD_ID = int(os.getenv("GUILD_ID", "1411337568691421234"))
-STATS_CHANNEL_ID = 1470111152183709826
-REPOST_CHANNEL_ID = 1467110703012774021
+# Stats feed (webhook) channel — must match where reports arrive.
+STATS_CHANNEL_ID = _int_env("STATS_CHANNEL_ID", 1470111152183709826)
+# Mission info / AAR repost destination (e.g. #mission-information-aar).
+REPOST_CHANNEL_ID = _int_env("REPOST_CHANNEL_ID", 1467110703012774021)
+
+# If 1/true: still repost to REPOST_CHANNEL_ID when player lines fail to parse (no stats update).
+_repost_raw = os.getenv("REPOST_WITHOUT_PARSED_PLAYERS", "").strip().lower()
+REPOST_WITHOUT_PARSED_PLAYERS = _repost_raw in ("1", "true", "yes", "on")
 
 WEBHOOK_ID_ALLOWED = 1467513629791490121
 CHIEF_DEV_ROLE_ID = 1467855407065071637
@@ -76,6 +89,11 @@ USERS_COL = "users"
 LINKS_COL = "links"
 DISCORD_LINKS_COL = "discord_links"
 AAR_ORIGINALS_COL = "aar_originals"
+
+log(
+    f"[Config] GUILD_ID={GUILD_ID} STATS_CHANNEL_ID={STATS_CHANNEL_ID} "
+    f"REPOST_CHANNEL_ID={REPOST_CHANNEL_ID} repost_without_players={REPOST_WITHOUT_PARSED_PLAYERS}"
+)
 
 
 def _load_service_account_info() -> dict:

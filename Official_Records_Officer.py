@@ -24,6 +24,7 @@ from shared_db import (
     LINKS_COL,
     OP_TIERS,
     REPOST_CHANNEL_ID,
+    REPOST_WITHOUT_PARSED_PLAYERS,
     STATS_CHANNEL_ID,
     UNIT_HEAD_ROLE_ID,
     WEBHOOK_ID_ALLOWED,
@@ -101,14 +102,29 @@ def parse_operation_key(report_text: str, message: discord.Message) -> str:
     return f"msg:{message.id}"
 
 
+def _is_players_section_header_line(ln: str) -> bool:
+    """Match 'Players:' or emoji-prefixed '👥 Players:' (Discord/game often adds emoji)."""
+    clean = ln.replace("*", "").strip()
+    if re.search(r"\bUID\s*:", clean, re.IGNORECASE):
+        return False
+    return bool(re.search(r"\bplayers\s*:", clean, re.IGNORECASE))
+
+
+def _is_objectives_section_header_line(ln: str) -> bool:
+    """Match 'Objectives Completed:' / '🎯 Objectives ...' etc., not player stat rows."""
+    clean = ln.replace("*", "").strip()
+    if re.search(r"\bUID\s*:", clean, re.IGNORECASE):
+        return False
+    return bool(re.search(r"\bobjectives\b", clean, re.IGNORECASE))
+
+
 def parse_players_from_report(report_text: str):
     t = report_text.replace("\r\n", "\n").replace("\r", "\n")
     lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
 
     start = -1
     for i, ln in enumerate(lines):
-        clean = ln.replace("*", "").strip()
-        if clean.lower().startswith("players"):
+        if _is_players_section_header_line(ln):
             start = i
             break
     if start == -1:
@@ -117,7 +133,7 @@ def parse_players_from_report(report_text: str):
     players = []
     for ln in lines[start + 1 :]:
         clean = ln.replace("*", "").strip()
-        if clean.lower().startswith("objectives"):
+        if _is_objectives_section_header_line(ln):
             break
 
         ln2 = re.sub(r"^\s*-\s*", "", ln)
@@ -654,8 +670,17 @@ class OfficialRecordsCog(commands.Cog):
 
         players = parse_players_from_report(report_text)
         if not players:
-            log("[Report] No players parsed from report.")
-            return
+            if REPOST_WITHOUT_PARSED_PLAYERS:
+                log(
+                    "[Report] No players parsed; will repost only (REPOST_WITHOUT_PARSED_PLAYERS=1). "
+                    "Stats/tiers are not updated."
+                )
+            else:
+                log(
+                    "[Report] No players parsed from report; AAR not reposted. "
+                    "Fix Players/UID/kill lines or set REPOST_WITHOUT_PARSED_PLAYERS=1 in .env."
+                )
+                return
 
         op_key = parse_operation_key(report_text, message)
         log(f"[Report] op_key={op_key} parsed_players={len(players)}")
@@ -715,6 +740,9 @@ class OfficialRecordsCog(commands.Cog):
             if dest is None:
                 dest = await self.bot.fetch_channel(REPOST_CHANNEL_ID)
 
+            dest_label = f"{getattr(dest, 'name', '?')} id={getattr(dest, 'id', REPOST_CHANNEL_ID)}"
+            log(f"[Repost] Sending to channel {dest_label}")
+
             if message.embeds:
                 for e in message.embeds:
                     ed = e.to_dict()
@@ -744,7 +772,13 @@ class OfficialRecordsCog(commands.Cog):
 
             log("[Repost] Report reposted successfully.")
         except (discord.Forbidden, discord.HTTPException) as e:
-            log(f"[Repost] Failed: {e}")
+            log(
+                f"[Repost] Failed to send to REPOST_CHANNEL_ID={REPOST_CHANNEL_ID}: {e} "
+                "(check bot can View/Send Messages in that channel and ID is correct.)"
+            )
+        except Exception as e:
+            log(f"[Repost] Unexpected error: {e}")
+            log(traceback.format_exc())
 
 
 if __name__ == "__main__":

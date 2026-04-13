@@ -3,8 +3,40 @@
 # Env: DISCORD_BOT_TOKEN, Firebase creds, optional VVIP_ROLE_ID
 
 import asyncio
+import importlib.util
 import os
+import subprocess
+import sys
 import traceback
+
+
+def _ensure_discord_py() -> None:
+    """Some hosts (e.g. PebbleHost) install requirements with one Python but run the bot with another."""
+    if importlib.util.find_spec("discord") is not None:
+        return
+    root = os.path.dirname(os.path.abspath(__file__))
+    req = os.path.join(root, "requirements.txt")
+    if not os.path.isfile(req):
+        print(
+            "discord.py is not available for this interpreter and requirements.txt was not found.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(
+        f"[BOOT] discord missing for sys.executable={sys.executable!r}; "
+        "running: python -m pip install -r requirements.txt",
+        file=sys.stderr,
+    )
+    r = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-r", req],
+        cwd=root,
+    )
+    if r.returncode != 0:
+        sys.exit(r.returncode)
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
+
+
+_ensure_discord_py()
 
 import discord
 from discord.ext import commands

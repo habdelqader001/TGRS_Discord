@@ -2,6 +2,8 @@
 # Firestore-backed stats, reposts, slash commands, and report handling.
 # Run via master_bot.py (single Discord connection). This module provides OfficialRecordsCog.
 
+import asyncio
+import random
 import re
 import traceback
 from typing import Optional
@@ -81,6 +83,41 @@ def sanitize_report_for_repost(text: str) -> str:
     t = re.sub(r"\s*│\s*", " | ", t)
     t = re.sub(r"[ \t]{2,}", " ", t)
     return t.strip()
+
+
+async def _channel_send_with_429_retry(
+    channel: discord.abc.Messageable,
+    *,
+    max_attempts: int = 6,
+    **send_kwargs,
+) -> discord.Message:
+    """Send a message; on HTTP 429 (Discord or Cloudflare edge HTML) retry with backoff."""
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be >= 1")
+    backoff = 8.0
+    for attempt in range(max_attempts):
+        try:
+            return await channel.send(**send_kwargs)
+        except discord.HTTPException as e:
+            if e.status != 429 or attempt >= max_attempts - 1:
+                raise
+            retry_after: Optional[float] = None
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                ra = resp.headers.get("Retry-After") if hasattr(resp, "headers") else None
+                if ra is not None:
+                    try:
+                        retry_after = float(ra)
+                    except (TypeError, ValueError):
+                        retry_after = None
+            wait = retry_after if retry_after is not None else backoff + random.uniform(0, 3)
+            wait = min(max(wait, 1.0), 600.0)
+            log(
+                f"[Repost] HTTP 429 (attempt {attempt + 1}/{max_attempts}), "
+                f"waiting {wait:.1f}s before retry"
+            )
+            await asyncio.sleep(wait)
+            backoff = min(backoff * 2, 120.0)
 
 
 def parse_operation_key(report_text: str, message: discord.Message) -> str:
@@ -759,22 +796,29 @@ class OfficialRecordsCog(commands.Cog):
                             fval = sanitize_report_for_repost(f.value) if f.value else f.value
                             new_e.add_field(name=fname, value=fval, inline=f.inline)
 
-                    sent = await dest.send(embed=new_e)
+                    sent = await _channel_send_with_429_retry(dest, embed=new_e)
                     db.collection(AAR_ORIGINALS_COL).document(str(sent.id)).set(
                         {"content": sent.content or "", "channel_id": dest.id}, merge=True
                     )
             else:
                 body = sanitize_report_for_repost(report_text)
-                sent = await dest.send(body)
+                sent = await _channel_send_with_429_retry(dest, content=body)
                 db.collection(AAR_ORIGINALS_COL).document(str(sent.id)).set(
                     {"content": sent.content or "", "channel_id": dest.id}, merge=True
                 )
 
             log("[Repost] Report reposted successfully.")
         except (discord.Forbidden, discord.HTTPException) as e:
+            cf_hint = ""
+            if isinstance(e, discord.HTTPException) and e.status == 429:
+                cf_hint = (
+                    " 429 with Cloudflare HTML (e.g. 1015) means the bot's public IP is temporarily "
+                    "rate-limited at discord.com's edge—not a channel permission issue. Wait, reduce API "
+                    "bursts, or change hosting egress; retries were already attempted."
+                )
             log(
                 f"[Repost] Failed to send to REPOST_CHANNEL_ID={REPOST_CHANNEL_ID}: {e} "
-                "(check bot can View/Send Messages in that channel and ID is correct.)"
+                f"(check bot can View/Send Messages in that channel and ID is correct.){cf_hint}"
             )
         except Exception as e:
             log(f"[Repost] Unexpected error: {e}")
